@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TrafficSignalBench — Visual Debugger</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=DM+Sans:wght@400;500;600;700&display=swap');
+
+  :root {
+    --bg: #080b10; --bg2: #0e1218; --bg3: #141a23; --card: #111820;
+    --border: #1e2a38; --border2: #2a3a4d;
+    --t1: #e2e8f0; --t2: #8494a7; --t3: #546274;
+    --green: #22d66f; --red: #ef4444; --yellow: #f59e0b; --blue: #3b82f6; --cyan: #06b6d4;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:'DM Sans',sans-serif; background:var(--bg); color:var(--t1); min-height:100vh; }
+
+  .header {
+    padding:14px 24px; display:flex; align-items:center; justify-content:space-between;
+    border-bottom:1px solid var(--border); background:var(--bg2);
+  }
+  .header-left { display:flex; align-items:center; gap:12px; }
+  .logo { width:32px; height:32px; background:linear-gradient(135deg,var(--green),var(--cyan)); border-radius:7px; display:flex; align-items:center; justify-content:center; font-size:16px; }
+  .title { font-family:'JetBrains Mono',monospace; font-size:1rem; font-weight:600; }
+  .title span { color:var(--t3); font-weight:400; }
+  .pill { font-family:'JetBrains Mono',monospace; font-size:.65rem; padding:3px 10px; border-radius:100px; font-weight:500; letter-spacing:.04em; text-transform:uppercase; }
+  .pill.idle { background:var(--bg3); color:var(--t3); }
+  .pill.ok { background:#22d66f25; color:var(--green); border:1px solid var(--green); }
+  .pill.run { background:#3b82f625; color:var(--blue); border:1px solid var(--blue); }
+  .pill.end { background:#f59e0b25; color:var(--yellow); border:1px solid var(--yellow); }
+
+  .transport {
+    padding:10px 24px; background:var(--bg2); border-bottom:1px solid var(--border);
+    display:flex; align-items:center; gap:10px;
+  }
+  .tbtn {
+    background:var(--bg3); color:var(--t2); border:1px solid var(--border); width:34px; height:34px;
+    border-radius:7px; cursor:pointer; font-size:13px; display:flex; align-items:center; justify-content:center;
+    transition:all .15s; font-family:inherit;
+  }
+  .tbtn:hover { background:var(--border); color:var(--t1); }
+  .tbtn.play { background:#22d66f20; color:var(--green); border-color:var(--green); width:42px; }
+  .tbtn.play:hover { background:var(--green); color:#000; }
+  .tbtn:disabled { opacity:.3; cursor:not-allowed; }
+  .tline-wrap { flex:1; display:flex; align-items:center; gap:10px; }
+  .tline { flex:1; height:5px; background:var(--bg3); border-radius:3px; cursor:pointer; border:1px solid var(--border); position:relative; }
+  .tline-fill { height:100%; background:linear-gradient(90deg,var(--cyan),var(--green)); border-radius:3px; transition:width .08s; position:relative; }
+  .tline-fill::after { content:''; position:absolute; right:-6px; top:-4px; width:12px; height:12px; background:var(--green); border-radius:50%; border:2px solid var(--bg2); }
+  .tinfo { font-family:'JetBrains Mono',monospace; font-size:.7rem; color:var(--t3); min-width:90px; text-align:right; }
+  .spd { background:var(--bg3); color:var(--t2); border:1px solid var(--border); padding:5px 8px; border-radius:5px; font-family:'JetBrains Mono',monospace; font-size:.65rem; }
+
+  .main { display:grid; grid-template-columns:1fr 320px; height:calc(100vh - 106px); }
+  @media(max-width:860px) { .main { grid-template-columns:1fr; } }
+
+  .canvas { display:flex; align-items:center; justify-content:center; position:relative; overflow:hidden; }
+  .grid { width:500px; height:500px; position:relative; flex-shrink:0; }
+
+  .road { position:absolute; background:#0c1019; border:1px solid var(--border); }
+  .road-h { height:52px; width:100%; }
+  .road-v { width:52px; height:100%; }
+  .road-h.r0 { top:114px; }  .road-h.r1 { top:334px; }
+  .road-v.c0 { left:114px; } .road-v.c1 { left:334px; }
+  .road-h::after { content:''; position:absolute; width:100%; height:1px; top:25px; background:repeating-linear-gradient(90deg,#1a253500,#1a2535 0,#1a2535 10px,transparent 10px,transparent 18px); }
+  .road-v::after { content:''; position:absolute; height:100%; width:1px; left:25px; background:repeating-linear-gradient(180deg,#1a253500,#1a2535 0,#1a2535 10px,transparent 10px,transparent 18px); }
+
+  .ix {
+    position:absolute; width:68px; height:68px; background:#0d1520; border:1.5px solid var(--border2);
+    border-radius:6px; display:flex; flex-direction:column; align-items:center; justify-content:center; z-index:10;
+    transition:border-color .3s, box-shadow .3s;
+  }
+  .ix.alert { border-color:var(--red); box-shadow:0 0 18px #ef444430; }
+  .p00 { left:106px; top:106px; } .p01 { left:326px; top:106px; }
+  .p10 { left:106px; top:326px; } .p11 { left:326px; top:326px; }
+  .ix-label { font-family:'JetBrains Mono',monospace; font-size:.45rem; color:var(--t3); margin-bottom:3px; }
+  .sigs { display:flex; gap:5px; }
+  .sig { width:15px; height:15px; border-radius:50%; transition:all .25s; }
+  .sig.g { background:var(--green); box-shadow:0 0 10px var(--green); }
+  .sig.r { background:var(--red); box-shadow:0 0 6px #ef444440; }
+  .sig.y { background:var(--yellow); box-shadow:0 0 10px var(--yellow); }
+  .ptag { font-family:'JetBrains Mono',monospace; font-size:.4rem; color:var(--t3); margin-top:2px; text-transform:uppercase; letter-spacing:.05em; }
+
+  #overlay { position:absolute; inset:0; pointer-events:none; }
+  .qbar { position:absolute; border-radius:2px; transition:all .15s; }
+  .qbar.ns { background:var(--cyan); } .qbar.ew { background:var(--blue); }
+  .qbar.em { background:var(--red); animation:fl .4s infinite alternate; }
+  @keyframes fl { from{opacity:.6} to{opacity:1} }
+  .qlbl { position:absolute; font-family:'JetBrains Mono',monospace; font-size:.55rem; color:var(--t2); }
+  .imark { position:absolute; z-index:20; font-family:'JetBrains Mono',monospace; font-size:.5rem; padding:2px 7px; border-radius:4px; white-space:nowrap; }
+  .imark.acc { background:#ef444425; color:var(--red); border:1px solid var(--red); }
+  .imark.emv { background:#f59e0b25; color:var(--yellow); border:1px solid var(--yellow); animation:fl .5s infinite alternate; }
+  .imark.std { background:#3b82f625; color:var(--blue); border:1px solid var(--blue); }
+
+  .side { border-left:1px solid var(--border); background:var(--bg2); overflow-y:auto; padding:14px; display:flex; flex-direction:column; gap:10px; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:9px; padding:12px; }
+  .ch { font-family:'JetBrains Mono',monospace; font-size:.6rem; color:var(--t3); text-transform:uppercase; letter-spacing:.07em; margin-bottom:8px; display:flex; align-items:center; gap:5px; }
+  .ch .d { width:5px; height:5px; border-radius:50%; }
+  .mr { display:flex; justify-content:space-between; align-items:center; padding:4px 0; }
+  .mr+.mr { border-top:1px solid var(--border); }
+  .ml { font-size:.78rem; color:var(--t2); }
+  .mv { font-family:'JetBrains Mono',monospace; font-size:.82rem; font-weight:600; }
+  .mv.good { color:var(--green); } .mv.warn { color:var(--yellow); } .mv.bad { color:var(--red); }
+  .score-big { font-family:'JetBrains Mono',monospace; font-size:2.2rem; font-weight:700; text-align:center; padding:6px 0; letter-spacing:-.03em; }
+  .score-sub { text-align:center; font-size:.65rem; color:var(--t3); text-transform:uppercase; letter-spacing:.08em; }
+  .brow { display:flex; align-items:center; gap:6px; padding:3px 0; }
+  .blbl { font-size:.65rem; color:var(--t2); min-width:72px; }
+  .btrack { flex:1; height:5px; background:var(--bg3); border-radius:3px; overflow:hidden; }
+  .bfill { height:100%; border-radius:3px; transition:width .4s; }
+  .bpct { font-family:'JetBrains Mono',monospace; font-size:.6rem; color:var(--t3); min-width:32px; text-align:right; }
+  .qr { display:flex; align-items:center; gap:5px; padding:2px 0; font-size:.72rem; }
+  .qr .qd { font-family:'JetBrains Mono',monospace; color:var(--t3); width:12px; text-align:center; font-size:.6rem; }
+  .qmb { height:4px; border-radius:2px; transition:width .15s; }
+  .ii { padding:7px 9px; border-radius:5px; margin-bottom:5px; font-size:.72rem; display:flex; gap:7px; align-items:flex-start; }
+  .ii.accident { background:#ef444418; } .ii.emergency_vehicle { background:#f59e0b18; } .ii.stadium_event { background:#3b82f618; }
+  .iico { font-size:.9rem; flex-shrink:0; }
+  .itxt { color:var(--t2); line-height:1.3; }
+  .empty { color:var(--t3); font-size:.72rem; text-align:center; padding:6px; }
+  .kh { display:flex; gap:10px; justify-content:center; padding:4px; }
+  .kh span { font-family:'JetBrains Mono',monospace; font-size:.5rem; color:var(--t3); }
+  .kh kbd { background:var(--bg3); border:1px solid var(--border); padding:1px 4px; border-radius:2px; font-size:.55rem; margin-right:2px; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-left">
+    <div class="logo">🚦</div>
+    <div class="title">TrafficSignalBench <span>/ debugger</span></div>
+  </div>
+  <div id="pill" class="pill idle">IDLE</div>
+</div>
+
+<div class="transport">
+  <button class="tbtn" onclick="stepBack()" id="bp" disabled>◀</button>
+  <button class="tbtn play" onclick="togglePlay()" id="bpl">▶</button>
+  <button class="tbtn" onclick="stepForward()" id="bn" disabled>▶</button>
+  <div class="tline-wrap">
+    <div class="tline" id="tl" onclick="seek(event)">
+      <div class="tline-fill" id="tf" style="width:0%"></div>
+    </div>
+    <div class="tinfo" id="ti">— / —</div>
+  </div>
+  <select class="spd" id="sp" onchange="chSpd()">
+    <option value="400">0.5×</option><option value="200" selected>1×</option>
+    <option value="100">2×</option><option value="50">4×</option><option value="25">8×</option>
+  </select>
+</div>
+
+<div class="main">
+  <div class="canvas">
+    <div class="grid">
+      <div class="road road-h r0"></div><div class="road road-h r1"></div>
+      <div class="road road-v c0"></div><div class="road road-v c1"></div>
+      <div class="ix p00" id="ix_int_0_0"><div class="ix-label">0,0</div><div class="sigs"><div class="sig r" id="s00n"></div><div class="sig r" id="s00e"></div></div><div class="ptag" id="pt00">—</div></div>
+      <div class="ix p01" id="ix_int_0_1"><div class="ix-label">0,1</div><div class="sigs"><div class="sig r" id="s01n"></div><div class="sig r" id="s01e"></div></div><div class="ptag" id="pt01">—</div></div>
+      <div class="ix p10" id="ix_int_1_0"><div class="ix-label">1,0</div><div class="sigs"><div class="sig r" id="s10n"></div><div class="sig r" id="s10e"></div></div><div class="ptag" id="pt10">—</div></div>
+      <div class="ix p11" id="ix_int_1_1"><div class="ix-label">1,1</div><div class="sigs"><div class="sig r" id="s11n"></div><div class="sig r" id="s11e"></div></div><div class="ptag" id="pt11">—</div></div>
+      <div id="overlay"></div>
+    </div>
+  </div>
+
+  <div class="side">
+    <div class="card">
+      <div class="ch"><div class="d" style="background:var(--green)"></div>Score</div>
+      <div class="score-big" id="scB">—</div>
+      <div class="score-sub">grader score</div>
+      <div id="scBd" style="margin-top:10px"></div>
+    </div>
+    <div class="card">
+      <div class="ch"><div class="d" style="background:var(--cyan)"></div>Metrics</div>
+      <div class="mr"><span class="ml">Time</span><span class="mv" id="mT">—</span></div>
+      <div class="mr"><span class="ml">Step</span><span class="mv" id="mS">0</span></div>
+      <div class="mr"><span class="ml">Cleared</span><span class="mv good" id="mC">0</span></div>
+      <div class="mr"><span class="ml">Waiting</span><span class="mv" id="mW">0</span></div>
+    </div>
+    <div class="card">
+      <div class="ch"><div class="d" style="background:var(--blue)"></div>Queues</div>
+      <div id="qP"></div>
+    </div>
+    <div class="card">
+      <div class="ch"><div class="d" style="background:var(--red)"></div>Incidents</div>
+      <div id="iP"><div class="empty">No active incidents</div></div>
+    </div>
+    <div class="kh"><span><kbd>Space</kbd> play</span><span><kbd>←</kbd><kbd>→</kbd> step</span></div>
+  </div>
+</div>
+
+<script>
+let D=[],F=0,playing=false,iv=null,spd=200,gd=null;
+const IX={int_0_0:{x:140,y:140,sn:'s00n',se:'s00e',pt:'pt00',el:'ix_int_0_0'},
+          int_0_1:{x:360,y:140,sn:'s01n',se:'s01e',pt:'pt01',el:'ix_int_0_1'},
+          int_1_0:{x:140,y:360,sn:'s10n',se:'s10e',pt:'pt10',el:'ix_int_1_0'},
+          int_1_1:{x:360,y:360,sn:'s11n',se:'s11e',pt:'pt11',el:'ix_int_1_1'}};
+
+window.addEventListener('DOMContentLoaded',async()=>{
+  try{
+    const r=await fetch('/replay'); D=await r.json();
+    if(!D.length){pill('idle','NO DATA');return;}
+    document.getElementById('bp').disabled=false;
+    document.getElementById('bn').disabled=false;
+    pill('ok','LOADED · '+D.length+' frames');
+    render(0);
+    try{const g=await fetch('/grade',{method:'POST'});gd=await g.json();showScore(gd);}catch(e){}
+  }catch(e){pill('idle','ERROR');}
+});
+
+function pill(c,t){const e=document.getElementById('pill');e.className='pill '+c;e.textContent=t;}
+function togglePlay(){
+  if(playing){clearInterval(iv);playing=false;document.getElementById('bpl').textContent='▶';pill('ok','PAUSED');}
+  else{playing=true;document.getElementById('bpl').textContent='⏸';pill('run','PLAYING');
+    iv=setInterval(()=>{if(F>=D.length-1){togglePlay();pill('end','DONE');return;}F++;render(F);},spd);}
+}
+function stepForward(){if(F<D.length-1){F++;render(F);}}
+function stepBack(){if(F>0){F--;render(F);}}
+function seek(e){const r=e.currentTarget.getBoundingClientRect();F=Math.round((e.clientX-r.left)/r.width*(D.length-1));render(F);}
+function chSpd(){spd=parseInt(document.getElementById('sp').value);if(playing){clearInterval(iv);iv=setInterval(()=>{if(F>=D.length-1){togglePlay();pill('end','DONE');return;}F++;render(F);},spd);}}
+document.addEventListener('keydown',e=>{if(e.key===' '){e.preventDefault();togglePlay();}if(e.key==='ArrowRight')stepForward();if(e.key==='ArrowLeft')stepBack();});
+
+function showScore(g){
+  const s=g.score;const el=document.getElementById('scB');
+  el.textContent=(s*100).toFixed(1)+'%';
+  el.style.color=s>=.7?'var(--green)':s>=.4?'var(--yellow)':'var(--red)';
+  let h='';const colors={throughput:'var(--green)',wait_time:'var(--cyan)',pedestrian_safety:'var(--yellow)',emergency_response:'var(--red)',incident_adaptation:'var(--blue)',starvation:'var(--yellow)',coordination:'var(--cyan)'};
+  for(const[k,v]of Object.entries(g.breakdown||{})){
+    const c=colors[k]||'var(--cyan)';
+    h+=`<div class="brow"><span class="blbl">${k.replace(/_/g,' ')}</span><div class="btrack"><div class="bfill" style="width:${v*100}%;background:${c}"></div></div><span class="bpct">${(v*100).toFixed(0)}%</span></div>`;
+  }
+  document.getElementById('scBd').innerHTML=h;
+}
+
+function sigClass(phase,which){
+  if(phase==='all_red')return 'r';
+  if(phase==='pedestrian')return 'y';
+  if(which==='ns')return(phase==='ns_green'||phase==='ns_left_arrow')?'g':'r';
+  return(phase==='ew_green'||phase==='ew_left_arrow')?'g':'r';
+}
+
+function render(idx){
+  const f=D[idx]; if(!f)return;
+  const pct=((idx/(D.length-1))*100).toFixed(1);
+  document.getElementById('tf').style.width=pct+'%';
+  document.getElementById('ti').textContent=`${f.time||'—'}  ·  ${idx+1}/${D.length}`;
+  document.getElementById('mT').textContent=f.time||'—';
+  document.getElementById('mS').textContent=f.step||0;
+  document.getElementById('mC').textContent=f.total_cleared||0;
+  const w=f.total_waiting||0;
+  const wE=document.getElementById('mW');wE.textContent=w;
+  wE.className='mv '+(w<=15?'good':w<=40?'warn':'bad');
+
+  let ov='',qh='';
+  const incIxs=new Set();(f.incidents||[]).forEach(i=>incIxs.add(i.intersection));
+
+  for(const[iid,ix]of Object.entries(f.intersections||{})){
+    const m=IX[iid]; if(!m)continue;
+    const ph=ix.phase||'all_red';
+    document.getElementById(m.sn).className='sig '+sigClass(ph,'ns');
+    document.getElementById(m.se).className='sig '+sigClass(ph,'ew');
+    document.getElementById(m.pt).textContent=ph.replace(/_/g,' ');
+    const ixEl=document.getElementById(m.el);
+    if(ixEl){ixEl.classList.toggle('alert',incIxs.has(iid));}
+
+    qh+=`<div style="margin-bottom:6px"><span style="font-family:'JetBrains Mono';font-size:.55rem;color:var(--t3)">${iid}</span>`;
+    for(const dir of['north','south','east','west']){
+      const q=(ix.queues||{})[dir]||{};
+      const tot=(q.through||0)+(q.left||0);
+      const isNS=dir==='north'||dir==='south';
+      const hasEm=q.has_emergency;
+
+      if(tot>0){
+        const len=Math.min(tot*3.5,75);
+        let bx,by,bw,bh;
+        if(dir==='north'){bx=m.x-7;by=m.y-36-len;bw=7;bh=len;}
+        else if(dir==='south'){bx=m.x;by=m.y+36;bw=7;bh=len;}
+        else if(dir==='west'){bx=m.x-36-len;by=m.y;bw=len;bh=7;}
+        else{bx=m.x+36;by=m.y-7;bw=len;bh=7;}
+        const cls=hasEm?'em':(isNS?'ns':'ew');
+        ov+=`<div class="qbar ${cls}" style="left:${bx}px;top:${by}px;width:${bw}px;height:${bh}px"></div>`;
+        let lx=dir==='west'?bx-14:dir==='east'?bx+bw+2:bx-1;
+        let ly=dir==='north'?by-11:dir==='south'?by+bh+1:by-1;
+        ov+=`<div class="qlbl" style="left:${lx}px;top:${ly}px">${tot}${hasEm?' 🚑':''}</div>`;
+      }
+
+      const bw2=Math.min(tot*5,110);
+      const clr=hasEm?'var(--red)':(isNS?'var(--cyan)':'var(--blue)');
+      qh+=`<div class="qr"><span class="qd">${dir[0].toUpperCase()}</span><div class="qmb" style="width:${bw2}px;background:${clr}"></div><span style="font-family:'JetBrains Mono';font-size:.55rem;color:var(--t2)">${tot}</span>${hasEm?'<span style="font-size:.65rem">🚑</span>':''}</div>`;
+    }
+
+    // Blocked lanes
+    for(const[dir,bl]of Object.entries(ix.blocked||{})){
+      if(!bl)continue;
+      let mx=m.x,my=m.y;
+      if(dir==='north')my-=60;else if(dir==='south')my+=50;
+      else if(dir==='west')mx-=70;else mx+=50;
+      ov+=`<div class="imark acc" style="left:${mx}px;top:${my}px">🚧 BLOCKED</div>`;
+    }
+    qh+='</div>';
+  }
+
+  document.getElementById('overlay').innerHTML=ov;
+  document.getElementById('qP').innerHTML=qh||'<div class="empty">—</div>';
+
+  // Incidents sidebar
+  const incs=f.incidents||[];
+  if(!incs.length){document.getElementById('iP').innerHTML='<div class="empty">No active incidents</div>';}
+  else{
+    const icons={accident:'🚧',emergency_vehicle:'🚑',stadium_event:'🏟️'};
+    document.getElementById('iP').innerHTML=incs.map(i=>
+      `<div class="ii ${i.type}"><span class="iico">${icons[i.type]||'⚠️'}</span><span class="itxt">${i.description}</span></div>`
+    ).join('');
+  }
+}
+</script>
+</body>
+</html>
