@@ -17,7 +17,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
+from typing import Optional
+
+from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -215,15 +217,19 @@ def list_tasks():
 
 
 @app.post("/reset")
-def reset(req: ResetRequest):
+async def reset(req: Optional[ResetRequest] = Body(default=None)):
     """Reset environment for a task. Returns initial observation."""
     global trajectory
     try:
-        obs = env.reset(task_id=req.task_id, seed=req.seed)
+        task_id = req.task_id if req else "easy"
+        seed = req.seed if req else 42
+        obs = env.reset(task_id=task_id, seed=seed)
         trajectory = []
         return obs.model_dump()
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/step")
