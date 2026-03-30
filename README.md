@@ -1,3 +1,15 @@
+---
+title: TrafficSignalBench
+emoji: 🚦
+colorFrom: green
+colorTo: blue
+sdk: docker
+app_port: 7860
+pinned: false
+tags:
+  - openenv
+---
+
 # 🚦 TrafficSignalBench
 
 An OpenEnv environment for AI agent traffic signal control. The agent manages traffic lights at a 2×2 intersection grid, optimizing vehicle throughput, minimizing wait times, ensuring pedestrian safety, and adapting to real-time incidents.
@@ -52,9 +64,9 @@ Each step returns an `Observation` containing:
 
 | Task | Score | Notes |
 |---|---|---|
-| `easy` | ~0.35 | Fixed-time alternating baseline |
-| `medium` | ~0.25 | No coordination strategy |
-| `hard` | ~0.20 | No incident adaptation |
+| `easy` | ~0.45 | Demand-responsive switching |
+| `medium` | ~0.40 | Basic coordination |
+| `hard` | ~0.35 | Reactive incident handling |
 
 ## Reward Function
 
@@ -74,18 +86,27 @@ The reward provides **dense signal** every step with interpretable components:
 ### Local Development
 
 ```bash
-# Clone and install
 pip install -r requirements.txt
 
 # Validate environment mechanics
 python test_env.py
 
-# Run baseline with heuristic agent (no API needed)
-python inference.py --mock
+# Start server
+uvicorn server:app --port 7860
 
-# Run with LLM agent
-export API_BASE_URL="https://your-api-endpoint"
-export MODEL_NAME="your-model-name"
+# Run demo episode (in another terminal)
+python run_demo.py
+
+# Visit visualizer
+open http://localhost:7860/visualize
+```
+
+### Inference with LLM
+
+```bash
+export API_BASE_URL="https://router.huggingface.co/v1"
+export MODEL_NAME="meta-llama/Llama-3.1-8B-Instruct"
+export HF_TOKEN="your_token"
 python inference.py
 ```
 
@@ -96,40 +117,17 @@ docker build -t traffic-signal-bench .
 docker run -p 7860:7860 traffic-signal-bench
 ```
 
-Then visit `http://localhost:7860/visualize` for the visual debugger.
+### API Endpoints
 
-### API Usage
-
-```bash
-# Reset environment
-curl -X POST http://localhost:7860/reset \
-  -H "Content-Type: application/json" \
-  -d '{"task_id": "hard", "seed": 42}'
-
-# Take a step
-curl -X POST http://localhost:7860/step \
-  -H "Content-Type: application/json" \
-  -d '{"actions": [{"action_type": "set_phase", "intersection_id": "int_0_0", "phase": "ns_green"}]}'
-
-# Get current state
-curl http://localhost:7860/state
-
-# Grade trajectory
-curl -X POST http://localhost:7860/grade
-
-# Get replay data
-curl http://localhost:7860/replay
-```
-
-### Visual Debugger
-
-After running an episode (via `inference.py` or API), visit `/visualize` for an interactive replay:
-- Play/pause, step forward/back, seek with slider
-- Real-time queue visualization on the 2×2 grid
-- Signal phase indicators (green/red per direction)
-- Incident markers and pedestrian wait alerts
-- Score breakdown panel
-- Keyboard shortcuts: Space (play/pause), ←/→ (step)
+| Endpoint | Method | Description |
+|---|---|---|
+| `/reset` | POST | Reset environment for a task |
+| `/step` | POST | Submit actions, advance simulation |
+| `/state` | GET | Get current environment state |
+| `/tasks` | GET | List available tasks |
+| `/grade` | POST | Grade current trajectory |
+| `/replay` | GET | Get replay log for visualizer |
+| `/visualize` | GET | Visual debugger UI |
 
 ## Project Structure
 
@@ -142,6 +140,7 @@ traffic-signal-bench/
 ├── server.py          # FastAPI server
 ├── inference.py       # Baseline inference script
 ├── test_env.py        # Environment validation tests
+├── run_demo.py        # Demo episode runner
 ├── openenv.yaml       # OpenEnv specification
 ├── requirements.txt   # Python dependencies
 ├── Dockerfile         # Container deployment
