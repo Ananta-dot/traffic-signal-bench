@@ -9,8 +9,25 @@ dependencies = [
     "pydantic>=2.5.0",
     "requests>=2.31.0",
     "openai>=1.6.0",
+    "openenv-core>=0.2.0",
 ]
+
+[project.scripts]
+server = "run_server:main"
 
 [build-system]
 requires = ["setuptools>=68.0"]
 build-backend = "setuptools.backends._legacy:_Backend"
+
+[tool.setuptools]
+py-modules = [
+    "server",
+    "run_server",
+    "environment",
+    "simulator",
+    "graders",
+    "models",
+    "inference",
+    "test_env",
+    "run_demo",
+]
