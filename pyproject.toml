@@ -1,0 +1,16 @@
+[project]
+name = "traffic-signal-bench"
+version = "1.0.0"
+description = "OpenEnv environment for AI agent traffic signal control"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.104.0",
+    "uvicorn>=0.24.0",
+    "pydantic>=2.5.0",
+    "requests>=2.31.0",
+    "openai>=1.6.0",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
