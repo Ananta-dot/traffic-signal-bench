@@ -1,234 +1,179 @@
 """
-Baseline inference script for TrafficSignalBench.
+Inference Script for TrafficSignalBench
+===================================
+MANDATORY
+- Before submitting, ensure the following variables are defined in your environment configuration:
+    API_BASE_URL   The API endpoint for the LLM.
+    MODEL_NAME     The model identifier to use for inference.
+    HF_TOKEN       Your Hugging Face / API key.
 
-Uses the OpenAI API client to run a model against the environment.
-Reads credentials from environment variables:
-  - API_BASE_URL: The API endpoint for the LLM
-  - MODEL_NAME: The model identifier to use
-  - HF_TOKEN: Your Hugging Face / API key (optional)
-
-Usage:
-  python inference.py                        # Run all tasks with LLM
-  python inference.py --task easy             # Run single task
-  python inference.py --mock                  # Run with heuristic agent (no API needed)
-  python inference.py --server http://...     # Run against deployed server
+- The inference script must be named `inference.py` and placed in the root directory of the project
+- Participants must use OpenAI Client for all LLM calls using above variables
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
+import re
 import sys
-import time
+import textwrap
+from typing import List
 
-import requests
-
-# Try to import openai for LLM-based agent
-try:
-    from openai import OpenAI
-    HAS_OPENAI = True
-except ImportError:
-    HAS_OPENAI = False
+from openai import OpenAI
 
 from environment import TrafficSignalEnv, TASKS
 from graders import grade
 from models import Action, ActionType, MultiAction, SignalPhase, Direction
 
+# ---------------------------------------------------------------------------
+# Environment variables (set by hackathon organizers during judging)
+# ---------------------------------------------------------------------------
+
+API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+MODEL_NAME = os.getenv("MODEL_NAME", "meta-llama/Llama-3.1-8B-Instruct")
+HF_TOKEN = os.getenv("HF_TOKEN")
+
+# Optional — if you use from_docker_image():
+LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
 
 # ---------------------------------------------------------------------------
-# Heuristic (mock) agent — no LLM needed
+# Config
 # ---------------------------------------------------------------------------
 
-class HeuristicAgent:
-    """Simple fixed-time agent for baseline comparison."""
+TEMPERATURE = 0.1
+MAX_TOKENS = 600
+SEED = 42
 
-    def decide(self, observation: dict) -> list[dict]:
-        """Return actions based on simple queue-length heuristics."""
-        actions = []
-        for ix in observation.get("intersections", []):
-            iid = ix["intersection_id"]
-            phase = ix["current_phase"]
-            timer = ix["phase_time_remaining"]
+# ---------------------------------------------------------------------------
+# System prompt for the LLM agent
+# ---------------------------------------------------------------------------
 
-            # Sum queues by direction group
-            ns_queue = sum(
-                lq["through_queue"] + lq["left_turn_queue"]
-                for lq in ix["lane_queues"]
-                if lq["direction"] in ("north", "south")
-            )
-            ew_queue = sum(
-                lq["through_queue"] + lq["left_turn_queue"]
-                for lq in ix["lane_queues"]
-                if lq["direction"] in ("east", "west")
-            )
+SYSTEM_PROMPT = textwrap.dedent("""
+You are an AI traffic signal controller managing intersections in a 2x2 grid.
+Each step you receive the current traffic state and must respond with a JSON array of actions.
 
-            # Check for emergency vehicles
-            has_emergency = any(
-                inc["incident_type"] == "emergency_vehicle"
-                and inc["intersection_id"] == iid
-                for inc in observation.get("incidents", [])
-            )
+AVAILABLE ACTIONS (one per intersection):
+- {"action_type": "set_phase", "intersection_id": "<id>", "phase": "<phase>"}
+  Phases: ns_green, ew_green, ns_left_arrow, ew_left_arrow, all_red, pedestrian
+- {"action_type": "extend_phase", "intersection_id": "<id>", "extend_seconds": <5-30>}
+- {"action_type": "emergency_preempt", "intersection_id": "<id>", "preempt_direction": "<dir>"}
+  Directions: north, south, east, west
+- {"action_type": "noop"}
 
-            if has_emergency:
-                # Find emergency direction and preempt
-                for inc in observation.get("incidents", []):
-                    if (inc["incident_type"] == "emergency_vehicle"
-                            and inc["intersection_id"] == iid
-                            and inc.get("direction")):
-                        actions.append({
-                            "action_type": "emergency_preempt",
-                            "intersection_id": iid,
-                            "preempt_direction": inc["direction"],
-                        })
-                        break
-                continue
+STRATEGY GUIDELINES:
+1. EMERGENCY VEHICLES: Highest priority. Immediately preempt to give green to the emergency direction.
+2. PEDESTRIANS: If any crossing has waited >70 seconds, switch to pedestrian phase soon.
+3. QUEUE BALANCING: Give more green time to the direction with longer queues.
+4. DON'T FLICKER: Avoid changing phases more than once every 15-20 seconds.
+5. COORDINATION: Try to keep adjacent intersections in compatible phases for green waves.
+6. STARVATION: Never leave any direction without green for more than 2.5 minutes.
 
-            # Check pedestrian wait
-            ped_max = max(ix.get("pedestrian_max_wait", {}).values(), default=0)
-            if ped_max > 80:
-                actions.append({
-                    "action_type": "set_phase",
-                    "intersection_id": iid,
-                    "phase": "pedestrian",
-                })
-                continue
-
-            # Simple demand-responsive: switch to direction with more traffic
-            if timer <= 5:
-                if ns_queue > ew_queue * 1.3:
-                    target = "ns_green"
-                elif ew_queue > ns_queue * 1.3:
-                    target = "ew_green"
-                else:
-                    # Alternate
-                    target = "ew_green" if phase in ("ns_green", "ns_left_arrow") else "ns_green"
-
-                actions.append({
-                    "action_type": "set_phase",
-                    "intersection_id": iid,
-                    "phase": target,
-                })
-            else:
-                actions.append({"action_type": "noop"})
-
-        return actions if actions else [{"action_type": "noop"}]
+Respond with ONLY a valid JSON array. No explanations, no markdown. Example:
+[{"action_type": "set_phase", "intersection_id": "int_0_0", "phase": "ns_green"}, {"action_type": "noop"}]
+""").strip()
 
 
 # ---------------------------------------------------------------------------
-# LLM-based agent
+# Observation formatting
 # ---------------------------------------------------------------------------
 
-class LLMAgent:
-    """Agent that uses an LLM to decide traffic signal actions."""
+def format_observation(obs: dict) -> str:
+    """Format observation into a concise prompt for the LLM."""
+    lines = [
+        f"Step {obs['step_number']} | Time: {obs['time_of_day']} | "
+        f"Total waiting: {obs['total_vehicles_waiting']} | "
+        f"Total cleared: {obs['total_vehicles_cleared']}"
+    ]
 
-    SYSTEM_PROMPT = """You are a traffic signal control agent managing a 2x2 grid of intersections.
+    for ix in obs.get("intersections", []):
+        iid = ix["intersection_id"]
+        phase = ix["current_phase"]
+        timer = ix["phase_time_remaining"]
+        lines.append(f"\n[{iid}] Phase: {phase} (remaining: {timer}s)")
 
-Your goal is to minimize vehicle wait times, ensure pedestrian safety, handle incidents,
-and maximize throughput.
+        for lq in ix["lane_queues"]:
+            total = lq["through_queue"] + lq["left_turn_queue"]
+            if total > 0:
+                lines.append(
+                    f"  {lq['direction']}: {total} vehicles "
+                    f"(through={lq['through_queue']}, left={lq['left_turn_queue']})"
+                )
 
-Available actions per intersection:
-- set_phase: Change signal to ns_green, ew_green, ns_left_arrow, ew_left_arrow, all_red, or pedestrian
-- extend_phase: Extend current phase by 5-30 seconds
-- emergency_preempt: Create green corridor for emergency vehicle (specify direction)
-- noop: Do nothing
+        for crossing, wait in ix.get("pedestrian_max_wait", {}).items():
+            if wait > 30:
+                count = ix.get("pedestrian_waiting", {}).get(crossing, 0)
+                lines.append(f"  Pedestrians {crossing.upper()}: {count} waiting, max wait {wait}s")
 
-IMPORTANT rules:
-- Don't flicker signals (rapid phase changes are penalized)
-- Don't starve any direction for >3 minutes
-- Address pedestrian waits >90 seconds (heavy penalty)
-- Emergency vehicles should be cleared ASAP (heaviest penalty)
-- Coordinate adjacent intersections for green waves when possible
+    if obs.get("incidents"):
+        lines.append("\nACTIVE INCIDENTS:")
+        for inc in obs["incidents"]:
+            dir_str = f" from {inc['direction']}" if inc.get("direction") else ""
+            remaining = f" ({inc['time_remaining']} steps left)" if inc.get("time_remaining") else ""
+            lines.append(f"  {inc['incident_type']}{dir_str} at {inc['intersection_id']}{remaining}")
+            lines.append(f"    {inc['description']}")
 
-Respond with a JSON array of actions. Example:
-[
-  {"action_type": "set_phase", "intersection_id": "int_0_0", "phase": "ns_green"},
-  {"action_type": "noop"}
-]"""
+    return "\n".join(lines)
 
-    def __init__(self, client: OpenAI, model: str):
-        self.client = client
-        self.model = model
 
-    def decide(self, observation: dict) -> list[dict]:
-        """Ask LLM to decide actions given current observation."""
-        obs_summary = self._format_observation(observation)
+# ---------------------------------------------------------------------------
+# Action parsing
+# ---------------------------------------------------------------------------
 
+ACTION_JSON_RE = re.compile(r"\[.*\]", re.DOTALL)
+
+
+def parse_llm_response(response_text: str) -> list[dict]:
+    """Parse the LLM response into a list of action dicts."""
+    if not response_text:
+        return [{"action_type": "noop"}]
+
+    text = response_text.strip()
+
+    # Strip markdown code fences if present
+    if "```" in text:
+        parts = text.split("```")
+        for part in parts:
+            part = part.strip()
+            if part.startswith("json"):
+                part = part[4:].strip()
+            if part.startswith("["):
+                text = part
+                break
+
+    # Try direct JSON parse
+    try:
+        result = json.loads(text)
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict):
+            return [result]
+    except json.JSONDecodeError:
+        pass
+
+    # Try to find JSON array in response
+    match = ACTION_JSON_RE.search(text)
+    if match:
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": self.SYSTEM_PROMPT},
-                    {"role": "user", "content": obs_summary},
-                ],
-                temperature=0.1,
-                max_tokens=500,
-            )
-            content = response.choices[0].message.content.strip()
+            result = json.loads(match.group(0))
+            if isinstance(result, list):
+                return result
+        except json.JSONDecodeError:
+            pass
 
-            # Parse JSON from response
-            # Handle markdown code blocks
-            if "```" in content:
-                content = content.split("```")[1]
-                if content.startswith("json"):
-                    content = content[4:]
-                content = content.strip()
-
-            actions = json.loads(content)
-            if isinstance(actions, dict):
-                actions = [actions]
-            return actions
-
-        except Exception as e:
-            print(f"  LLM error: {e}, using noop", file=sys.stderr)
-            return [{"action_type": "noop"}]
-
-    def _format_observation(self, obs: dict) -> str:
-        """Format observation into a concise prompt."""
-        lines = [f"Step {obs['step_number']} | Time: {obs['time_of_day']} | "
-                 f"Waiting: {obs['total_vehicles_waiting']} | Cleared: {obs['total_vehicles_cleared']}"]
-
-        for ix in obs.get("intersections", []):
-            lines.append(f"\n{ix['intersection_id']} — Phase: {ix['current_phase']} "
-                         f"(remaining: {ix['phase_time_remaining']}s)")
-            for lq in ix["lane_queues"]:
-                total = lq["through_queue"] + lq["left_turn_queue"]
-                if total > 0:
-                    lines.append(f"  {lq['direction']}: {total} vehicles "
-                                 f"(through={lq['through_queue']}, left={lq['left_turn_queue']})")
-            ped = ix.get("pedestrian_max_wait", {})
-            for crossing, wait in ped.items():
-                if wait > 30:
-                    lines.append(f"  ⚠ Pedestrian {crossing} waiting {wait}s")
-
-        if obs.get("incidents"):
-            lines.append("\n⚠ INCIDENTS:")
-            for inc in obs["incidents"]:
-                lines.append(f"  {inc['incident_type']}: {inc['description']}")
-
-        lines.append("\nDecide actions (JSON array):")
-        return "\n".join(lines)
+    print(f"  Warning: Could not parse LLM response, using noop", file=sys.stderr)
+    return [{"action_type": "noop"}]
 
 
 # ---------------------------------------------------------------------------
 # Episode runner
 # ---------------------------------------------------------------------------
 
-def run_episode(task_id: str, agent, seed: int = 42,
-                use_server: bool = False, server_url: str = "") -> dict:
-    """Run a single episode and return results."""
-    print(f"\n{'='*60}")
-    print(f"Task: {task_id} | Seed: {seed}")
-    print(f"{'='*60}")
+def run_episode(task_id: str, client: OpenAI, model: str, seed: int = 42) -> dict:
+    """Run a single episode using the LLM agent."""
+    # START log for this task
+    print(f"START task={task_id} seed={seed}")
 
-    if use_server:
-        return _run_episode_server(task_id, agent, seed, server_url)
-    else:
-        return _run_episode_local(task_id, agent, seed)
-
-
-def _run_episode_local(task_id: str, agent, seed: int) -> dict:
-    """Run episode using local environment."""
     env = TrafficSignalEnv()
     obs = env.reset(task_id=task_id, seed=seed)
     obs_dict = obs.model_dump()
@@ -236,18 +181,53 @@ def _run_episode_local(task_id: str, agent, seed: int) -> dict:
     trajectory = []
     total_reward = 0.0
     step_count = 0
+    action_history: list[str] = []
 
     while True:
-        # Agent decides
-        action_dicts = agent.decide(obs_dict)
+        # Format observation for LLM
+        user_prompt = format_observation(obs_dict)
 
-        # Parse actions
+        # Add recent action history for context
+        if action_history:
+            recent = action_history[-3:]
+            user_prompt += "\n\nYour last actions:\n" + "\n".join(recent)
+
+        user_prompt += "\n\nRespond with a JSON array of actions for this step:"
+
+        # Call LLM
+        try:
+            completion = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=TEMPERATURE,
+                max_tokens=MAX_TOKENS,
+                stream=False,
+            )
+            response_text = completion.choices[0].message.content or ""
+        except Exception as exc:
+            print(f"  LLM error at step {step_count}: {exc}", file=sys.stderr)
+            response_text = '[{"action_type": "noop"}]'
+
+        # Parse response into actions
+        action_dicts = parse_llm_response(response_text)
+
+        # Convert to typed Action objects
         actions = []
         for ad in action_dicts:
-            actions.append(Action(**ad))
+            try:
+                actions.append(Action(**ad))
+            except Exception:
+                actions.append(Action(action_type=ActionType.NOOP))
+
+        if not actions:
+            actions = [Action(action_type=ActionType.NOOP)]
+
         multi = MultiAction(actions=actions)
 
-        # Step
+        # Step environment
         obs, reward, done, info = env.step(multi)
         obs_dict = obs.model_dump()
         total_reward += reward.total
@@ -258,20 +238,23 @@ def _run_episode_local(task_id: str, agent, seed: int) -> dict:
         if replay:
             trajectory.append(replay[-1])
 
-        # Progress
-        if step_count % 30 == 0:
-            print(f"  Step {step_count}: waiting={obs.total_vehicles_waiting}, "
-                  f"cleared={obs.total_vehicles_cleared}, reward={reward.total:.2f}")
+        # STEP log
+        action_summary = ", ".join(
+            f"{a.action_type}({a.intersection_id or ''}, {a.phase or a.preempt_direction or ''})"
+            for a in actions
+        )
+        print(f"STEP task={task_id} step={step_count} reward={reward.total:+.2f} waiting={obs.total_vehicles_waiting} cleared={obs.total_vehicles_cleared}")
+
+        action_history.append(f"Step {step_count}: {action_summary} -> reward {reward.total:+.2f}")
 
         if done:
             break
 
-    # Grade
+    # Grade the trajectory
     result = grade(task_id, trajectory)
-    print(f"\n  Score: {result.score:.4f}")
-    print(f"  Breakdown: {result.breakdown}")
-    print(f"  {result.details}")
-    print(f"  Total reward: {total_reward:.2f}")
+
+    # END log for this task
+    print(f"END task={task_id} score={result.score:.4f} steps={step_count} reward={total_reward:.2f}")
 
     return {
         "task_id": task_id,
@@ -279,52 +262,7 @@ def _run_episode_local(task_id: str, agent, seed: int) -> dict:
         "breakdown": result.breakdown,
         "total_reward": total_reward,
         "steps": step_count,
-    }
-
-
-def _run_episode_server(task_id: str, agent, seed: int, server_url: str) -> dict:
-    """Run episode against a deployed server."""
-    base = server_url.rstrip("/")
-
-    # Reset
-    resp = requests.post(f"{base}/reset", json={"task_id": task_id, "seed": seed})
-    resp.raise_for_status()
-    obs_dict = resp.json()
-
-    total_reward = 0.0
-    step_count = 0
-
-    while True:
-        action_dicts = agent.decide(obs_dict)
-
-        resp = requests.post(f"{base}/step", json={"actions": action_dicts})
-        resp.raise_for_status()
-        result = resp.json()
-
-        obs_dict = result["observation"]
-        total_reward += result["reward"]["total"]
-        step_count += 1
-        done = result["done"]
-
-        if step_count % 30 == 0:
-            print(f"  Step {step_count}: waiting={obs_dict['total_vehicles_waiting']}, "
-                  f"cleared={obs_dict['total_vehicles_cleared']}")
-
-        if done:
-            break
-
-    # Grade
-    resp = requests.post(f"{base}/grade")
-    grade_result = resp.json()
-    print(f"\n  Score: {grade_result['score']:.4f}")
-    print(f"  Breakdown: {grade_result['breakdown']}")
-
-    return {
-        "task_id": task_id,
-        "score": grade_result["score"],
-        "breakdown": grade_result["breakdown"],
-        "total_reward": total_reward,
-        "steps": step_count,
+        "details": result.details,
     }
 
 
@@ -332,63 +270,42 @@ def _run_episode_server(task_id: str, agent, seed: int, server_url: str) -> dict
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
-    parser = argparse.ArgumentParser(description="TrafficSignalBench Inference")
-    parser.add_argument("--task", type=str, default=None,
-                        help="Task ID (easy/medium/hard). Default: run all.")
-    parser.add_argument("--mock", action="store_true",
-                        help="Use heuristic agent instead of LLM")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--server", type=str, default=None,
-                        help="Server URL for remote execution")
-    args = parser.parse_args()
+def main() -> None:
+    if not MODEL_NAME:
+        print("ERROR: MODEL_NAME environment variable is required.")
+        print("Set: export API_BASE_URL=... MODEL_NAME=... HF_TOKEN=...")
+        sys.exit(1)
 
-    # Setup agent
-    if args.mock:
-        print("Using heuristic (mock) agent")
-        agent = HeuristicAgent()
-    else:
-        api_base = os.environ.get("API_BASE_URL", "")
-        model_name = os.environ.get("MODEL_NAME", "")
-        if not api_base or not model_name:
-            print("ERROR: API_BASE_URL and MODEL_NAME environment variables required.")
-            print("Use --mock flag to run with heuristic agent instead.")
-            sys.exit(1)
+    if not HF_TOKEN:
+        print("ERROR: HF_TOKEN environment variable is required.")
+        sys.exit(1)
 
-        if not HAS_OPENAI:
-            print("ERROR: openai package not installed. Run: pip install openai")
-            sys.exit(1)
+    client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
 
-        client = OpenAI(base_url=api_base, api_key=os.environ.get("HF_TOKEN", "none"))
-        agent = LLMAgent(client, model_name)
-        print(f"Using LLM agent: {model_name} @ {api_base}")
+    print(f"START inference")
+    print(f"  API:   {API_BASE_URL}")
+    print(f"  Model: {MODEL_NAME}")
 
-    # Run tasks
-    tasks = [args.task] if args.task else ["easy", "medium", "hard"]
+    # Run all 3 tasks
+    tasks = ["easy", "medium", "hard"]
     results = []
 
     for task_id in tasks:
-        result = run_episode(
-            task_id, agent, seed=args.seed,
-            use_server=bool(args.server),
-            server_url=args.server or "",
-        )
+        result = run_episode(task_id, client, MODEL_NAME, seed=SEED)
         results.append(result)
 
     # Summary
-    print(f"\n{'='*60}")
-    print("SUMMARY")
-    print(f"{'='*60}")
     for r in results:
-        print(f"  {r['task_id']:8s}: score={r['score']:.4f}  reward={r['total_reward']:.2f}  steps={r['steps']}")
+        print(f"  {r['task_id']:8s}: score={r['score']:.4f}  reward={r['total_reward']:+.2f}  steps={r['steps']}")
 
     avg_score = sum(r["score"] for r in results) / len(results)
-    print(f"\n  Average score: {avg_score:.4f}")
+    print(f"  Average score: {avg_score:.4f}")
 
-    # Write results to file for reproducibility
+    # Save results for reproducibility
     with open("baseline_results.json", "w") as f:
         json.dump(results, f, indent=2)
-    print("\nResults saved to baseline_results.json")
+
+    print(f"END inference avg_score={avg_score:.4f}")
 
 
 if __name__ == "__main__":
