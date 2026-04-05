@@ -1,0 +1,35 @@
+name: traffic_signal_bench
+version: "1.0.0"
+description: >
+  AI agent environment for urban traffic signal control.
+  Manage traffic lights at a 2x2 intersection grid, optimize throughput,
+  minimize wait times, ensure pedestrian safety, and handle incidents.
+
+env_class: environment.TrafficSignalEnv
+action_class: models.MultiAction
+observation_class: models.Observation
+
+tasks:
+  - id: easy
+    name: "Single Intersection — Steady Traffic"
+    difficulty: easy
+    description: "Control a single intersection with predictable traffic patterns."
+
+  - id: medium
+    name: "2x2 Grid — Coordinated Signals with Pedestrians"
+    difficulty: medium
+    description: "Coordinate four intersections for green wave optimization with pedestrian constraints."
+
+  - id: hard
+    name: "2x2 Grid — Incidents and Emergency Vehicles"
+    difficulty: hard
+    description: "Full grid with accidents, emergency vehicle preemption, and stadium traffic surge."
+
+server:
+  app: server:app
+  port: 7860
+  framework: fastapi
+
+docker:
+  dockerfile: Dockerfile
+  port: 7860
