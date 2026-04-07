@@ -27,15 +27,14 @@ from graders import grade
 from models import Action, ActionType, MultiAction, SignalPhase, Direction
 
 # ---------------------------------------------------------------------------
-# Environment variables (set by hackathon organizers during judging)
+# Environment variables
 # ---------------------------------------------------------------------------
 
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "meta-llama/Llama-3.1-8B-Instruct")
 HF_TOKEN = os.getenv("HF_TOKEN")
-
-# Optional — if you use from_docker_image():
 LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
+BENCHMARK = "TrafficSignalBench"
 
 # ---------------------------------------------------------------------------
 # Config
@@ -61,18 +60,9 @@ AVAILABLE ACTIONS (one per intersection):
   Directions: north, south, east, west
 - {"action_type": "noop"}
 
-STRATEGY GUIDELINES:
-1. EMERGENCY VEHICLES: Highest priority. Immediately preempt to give green to the emergency direction.
-2. PEDESTRIANS: If any crossing has waited >70 seconds, switch to pedestrian phase soon.
-3. QUEUE BALANCING: Give more green time to the direction with longer queues.
-4. DON'T FLICKER: Avoid changing phases more than once every 15-20 seconds.
-5. COORDINATION: Try to keep adjacent intersections in compatible phases for green waves.
-6. STARVATION: Never leave any direction without green for more than 2.5 minutes.
-
 Respond with ONLY a valid JSON array. No explanations, no markdown. Example:
 [{"action_type": "set_phase", "intersection_id": "int_0_0", "phase": "ns_green"}, {"action_type": "noop"}]
 """).strip()
-
 
 # ---------------------------------------------------------------------------
 # Observation formatting
@@ -111,7 +101,6 @@ def format_observation(obs: dict) -> str:
             dir_str = f" from {inc['direction']}" if inc.get("direction") else ""
             remaining = f" ({inc['time_remaining']} steps left)" if inc.get("time_remaining") else ""
             lines.append(f"  {inc['incident_type']}{dir_str} at {inc['intersection_id']}{remaining}")
-            lines.append(f"    {inc['description']}")
 
     return "\n".join(lines)
 
@@ -122,15 +111,11 @@ def format_observation(obs: dict) -> str:
 
 ACTION_JSON_RE = re.compile(r"\[.*\]", re.DOTALL)
 
-
 def parse_llm_response(response_text: str) -> list[dict]:
-    """Parse the LLM response into a list of action dicts."""
     if not response_text:
         return [{"action_type": "noop"}]
 
     text = response_text.strip()
-
-    # Strip markdown code fences if present
     if "```" in text:
         parts = text.split("```")
         for part in parts:
@@ -141,7 +126,6 @@ def parse_llm_response(response_text: str) -> list[dict]:
                 text = part
                 break
 
-    # Try direct JSON parse
     try:
         result = json.loads(text)
         if isinstance(result, list):
@@ -151,7 +135,6 @@ def parse_llm_response(response_text: str) -> list[dict]:
     except json.JSONDecodeError:
         pass
 
-    # Try to find JSON array in response
     match = ACTION_JSON_RE.search(text)
     if match:
         try:
@@ -161,7 +144,6 @@ def parse_llm_response(response_text: str) -> list[dict]:
         except json.JSONDecodeError:
             pass
 
-    print(f"  Warning: Could not parse LLM response, using noop", file=sys.stderr)
     return [{"action_type": "noop"}]
 
 
@@ -170,32 +152,28 @@ def parse_llm_response(response_text: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def run_episode(task_id: str, client: OpenAI, model: str, seed: int = 42) -> dict:
-    """Run a single episode using the LLM agent."""
-    
-    # REQUIRED START LOG WITH FLUSH
-    print(f"[START] task={task_id}", flush=True)
+    # 1. STRICT START FORMAT
+    print(f"[START] task={task_id} env={BENCHMARK} model={model}", flush=True)
 
     env = TrafficSignalEnv()
     obs = env.reset(task_id=task_id, seed=seed)
     obs_dict = obs.model_dump()
 
     trajectory = []
+    rewards_list = []
     total_reward = 0.0
     step_count = 0
     action_history: list[str] = []
 
     while True:
-        # Format observation for LLM
         user_prompt = format_observation(obs_dict)
 
-        # Add recent action history for context
         if action_history:
             recent = action_history[-3:]
             user_prompt += "\n\nYour last actions:\n" + "\n".join(recent)
 
         user_prompt += "\n\nRespond with a JSON array of actions for this step:"
 
-        # Call LLM
         try:
             completion = client.chat.completions.create(
                 model=model,
@@ -208,14 +186,14 @@ def run_episode(task_id: str, client: OpenAI, model: str, seed: int = 42) -> dic
                 stream=False,
             )
             response_text = completion.choices[0].message.content or ""
+            error_val = "null"
         except Exception as exc:
-            print(f"  LLM error at step {step_count}: {exc}", file=sys.stderr)
+            print(f"[DEBUG] LLM error: {exc}", file=sys.stderr)
             response_text = '[{"action_type": "noop"}]'
+            error_val = str(exc).replace(" ", "_") # No spaces allowed in stdout error trace
 
-        # Parse response into actions
         action_dicts = parse_llm_response(response_text)
-
-        # Convert to typed Action objects
+        
         actions = []
         for ad in action_dicts:
             try:
@@ -228,42 +206,46 @@ def run_episode(task_id: str, client: OpenAI, model: str, seed: int = 42) -> dic
 
         multi = MultiAction(actions=actions)
 
-        # Step environment
         obs, reward, done, info = env.step(multi)
         obs_dict = obs.model_dump()
-        total_reward += reward.total
+        
+        step_reward = float(reward.total)
+        total_reward += step_reward
+        rewards_list.append(step_reward)
         step_count += 1
 
-        # Record trajectory
         replay = env.get_replay_log()
         if replay:
             trajectory.append(replay[-1])
 
-        # REQUIRED STEP LOG WITH FLUSH
-        print(f"[STEP] step={step_count} reward={reward.total:+.2f}", flush=True)
+        # Formatting action string to have no spaces or newlines for stdout
+        action_str = "|".join(f"{a.action_type.value}:{a.intersection_id or 'none'}" for a in actions)
+        done_val = str(done).lower()
 
-        action_summary = ", ".join(
-            f"{a.action_type}({a.intersection_id or ''}, {a.phase or a.preempt_direction or ''})"
-            for a in actions
-        )
-        action_history.append(f"Step {step_count}: {action_summary} -> reward {reward.total:+.2f}")
+        # 2. STRICT STEP FORMAT
+        print(f"[STEP] step={step_count} action={action_str} reward={step_reward:.2f} done={done_val} error={error_val}", flush=True)
+
+        action_history.append(f"Step {step_count}: {action_str} -> reward {step_reward:+.2f}")
 
         if done:
             break
 
     # Grade the trajectory
     result = grade(task_id, trajectory)
+    
+    # Ensure score is strictly clamped to [0, 1] as requested by validation rules
+    clamped_score = max(0.0, min(1.0, float(result.score)))
+    success_val = "true" if clamped_score >= 0.1 else "false" # Assuming threshold > 0.1 is success
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards_list)
 
-    # REQUIRED END LOG WITH FLUSH
-    print(f"[END] task={task_id} score={result.score:.4f} steps={step_count}", flush=True)
+    # 3. STRICT END FORMAT
+    print(f"[END] success={success_val} steps={step_count} score={clamped_score:.3f} rewards={rewards_str}", flush=True)
 
     return {
         "task_id": task_id,
-        "score": result.score,
-        "breakdown": result.breakdown,
+        "score": clamped_score,
         "total_reward": total_reward,
         "steps": step_count,
-        "details": result.details,
     }
 
 
@@ -274,7 +256,6 @@ def run_episode(task_id: str, client: OpenAI, model: str, seed: int = 42) -> dic
 def main() -> None:
     if not MODEL_NAME:
         print("ERROR: MODEL_NAME environment variable is required.", file=sys.stderr)
-        print("Set: export API_BASE_URL=... MODEL_NAME=... HF_TOKEN=...", file=sys.stderr)
         sys.exit(1)
 
     if not HF_TOKEN:
@@ -283,9 +264,6 @@ def main() -> None:
 
     client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
 
-    print(f"Starting inference initialization...", file=sys.stderr)
-
-    # Run all 3 tasks
     tasks = ["easy", "medium", "hard"]
     results = []
 
@@ -293,14 +271,8 @@ def main() -> None:
         result = run_episode(task_id, client, MODEL_NAME, seed=SEED)
         results.append(result)
 
-    # Summary (Moved to stderr so it doesn't mess with the validator's stdout parsing)
-    for r in results:
-        print(f"  {r['task_id']:8s}: score={r['score']:.4f}  reward={r['total_reward']:+.2f}  steps={r['steps']}", file=sys.stderr)
-
     avg_score = sum(r["score"] for r in results) / len(results)
-    print(f"  Average score: {avg_score:.4f}", file=sys.stderr)
-
-    # Save results for reproducibility
+    
     with open("baseline_results.json", "w") as f:
         json.dump(results, f, indent=2)
 
