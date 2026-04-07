@@ -171,8 +171,9 @@ def parse_llm_response(response_text: str) -> list[dict]:
 
 def run_episode(task_id: str, client: OpenAI, model: str, seed: int = 42) -> dict:
     """Run a single episode using the LLM agent."""
-    # START log for this task
-    print(f"START task={task_id} seed={seed}")
+    
+    # REQUIRED START LOG WITH FLUSH
+    print(f"[START] task={task_id}", flush=True)
 
     env = TrafficSignalEnv()
     obs = env.reset(task_id=task_id, seed=seed)
@@ -238,13 +239,13 @@ def run_episode(task_id: str, client: OpenAI, model: str, seed: int = 42) -> dic
         if replay:
             trajectory.append(replay[-1])
 
-        # STEP log
+        # REQUIRED STEP LOG WITH FLUSH
+        print(f"[STEP] step={step_count} reward={reward.total:+.2f}", flush=True)
+
         action_summary = ", ".join(
             f"{a.action_type}({a.intersection_id or ''}, {a.phase or a.preempt_direction or ''})"
             for a in actions
         )
-        print(f"STEP task={task_id} step={step_count} reward={reward.total:+.2f} waiting={obs.total_vehicles_waiting} cleared={obs.total_vehicles_cleared}")
-
         action_history.append(f"Step {step_count}: {action_summary} -> reward {reward.total:+.2f}")
 
         if done:
@@ -253,8 +254,8 @@ def run_episode(task_id: str, client: OpenAI, model: str, seed: int = 42) -> dic
     # Grade the trajectory
     result = grade(task_id, trajectory)
 
-    # END log for this task
-    print(f"END task={task_id} score={result.score:.4f} steps={step_count} reward={total_reward:.2f}")
+    # REQUIRED END LOG WITH FLUSH
+    print(f"[END] task={task_id} score={result.score:.4f} steps={step_count}", flush=True)
 
     return {
         "task_id": task_id,
@@ -272,19 +273,17 @@ def run_episode(task_id: str, client: OpenAI, model: str, seed: int = 42) -> dic
 
 def main() -> None:
     if not MODEL_NAME:
-        print("ERROR: MODEL_NAME environment variable is required.")
-        print("Set: export API_BASE_URL=... MODEL_NAME=... HF_TOKEN=...")
+        print("ERROR: MODEL_NAME environment variable is required.", file=sys.stderr)
+        print("Set: export API_BASE_URL=... MODEL_NAME=... HF_TOKEN=...", file=sys.stderr)
         sys.exit(1)
 
     if not HF_TOKEN:
-        print("ERROR: HF_TOKEN environment variable is required.")
+        print("ERROR: HF_TOKEN environment variable is required.", file=sys.stderr)
         sys.exit(1)
 
     client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
 
-    print(f"START inference")
-    print(f"  API:   {API_BASE_URL}")
-    print(f"  Model: {MODEL_NAME}")
+    print(f"Starting inference initialization...", file=sys.stderr)
 
     # Run all 3 tasks
     tasks = ["easy", "medium", "hard"]
@@ -294,19 +293,16 @@ def main() -> None:
         result = run_episode(task_id, client, MODEL_NAME, seed=SEED)
         results.append(result)
 
-    # Summary
+    # Summary (Moved to stderr so it doesn't mess with the validator's stdout parsing)
     for r in results:
-        print(f"  {r['task_id']:8s}: score={r['score']:.4f}  reward={r['total_reward']:+.2f}  steps={r['steps']}")
+        print(f"  {r['task_id']:8s}: score={r['score']:.4f}  reward={r['total_reward']:+.2f}  steps={r['steps']}", file=sys.stderr)
 
     avg_score = sum(r["score"] for r in results) / len(results)
-    print(f"  Average score: {avg_score:.4f}")
+    print(f"  Average score: {avg_score:.4f}", file=sys.stderr)
 
     # Save results for reproducibility
     with open("baseline_results.json", "w") as f:
         json.dump(results, f, indent=2)
-
-    print(f"END inference avg_score={avg_score:.4f}")
-
 
 if __name__ == "__main__":
     main()
