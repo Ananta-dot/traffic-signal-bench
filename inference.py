@@ -219,7 +219,14 @@ def run_episode(task_id: str, client: OpenAI, model: str, seed: int = 42) -> dic
             trajectory.append(replay[-1])
 
         # Formatting action string to have no spaces or newlines for stdout
-        action_str = "|".join(f"{a.action_type.value}:{a.intersection_id or 'none'}" for a in actions)
+        # Formatting action string safely (handles both Enums and standard strings)
+        action_str_parts = []
+        for a in actions:
+            act_val = a.action_type.value if hasattr(a.action_type, 'value') else str(a.action_type)
+            int_id = str(a.intersection_id) if a.intersection_id else "none"
+            action_str_parts.append(f"{act_val}:{int_id}")
+        
+        action_str = "|".join(action_str_parts).replace(" ", "_")
         done_val = str(done).lower()
 
         # 2. STRICT STEP FORMAT
